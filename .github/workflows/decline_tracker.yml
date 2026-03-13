@@ -1,1 +1,44 @@
 
+name: Meme Decline Scanner
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"   # cada 2 horas exactas
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8       # más tiempo porque analiza muchos coins
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Restaurar estado previo
+        uses: actions/cache/restore@v4
+        with:
+          path: decline_state.json
+          key: decline-never-matches
+          restore-keys: |
+            decline-state-
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: pip install requests
+
+      - name: Correr decline scanner
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python decline_tracker.py
+
+      - name: Guardar estado
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: decline_state.json
+          key: decline-state-${{ github.run_id }}-${{ github.run_attempt }}
