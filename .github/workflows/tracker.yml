@@ -1,1 +1,45 @@
 
+name: Binance Meme Futures Tracker
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Restaurar estado previo
+        uses: actions/cache/restore@v4
+        with:
+          path: seen_listings.json
+          key: seen-never-matches
+          restore-keys: |
+            seen-listings-
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: pip install requests
+
+      - name: Correr tracker
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python tracker.py
+
+      - name: Guardar estado
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: seen_listings.json
+          key: seen-listings-${{ github.run_id }}-${{ github.run_attempt }}
