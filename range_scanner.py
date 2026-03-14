@@ -1,6 +1,7 @@
 """
 Wyckoff Range Scanner — TCT Method
-Usa CCXT para evitar bloqueos de IP de Binance en GitHub Actions.
+Usa Bybit API (sin restricciones de IP en GitHub Actions).
+Los precios de Bybit y Binance son prácticamente idénticos.
 """
 
 import os
@@ -19,6 +20,11 @@ TOUCH_TOLERANCE_PCT     = 0.003
 DEVIATION_THRESHOLD_PCT = 0.005
 ALERT_COOLDOWN_HOURS    = 8
 
+BYBIT_TICKERS = "https://api.bybit.com/v5/market/tickers"
+BYBIT_KLINES  = "https://api.bybit.com/v5/market/kline"
+
+HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+
 
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
@@ -36,28 +42,34 @@ def save_state(state: dict):
 
 
 def get_top_symbols(n: int) -> list[str]:
-    """Usa CoinGecko para obtener top coins por volumen, después mapea a símbolos de Binance."""
+    """Top coins por volumen en Bybit Futures (linear = USDT perpetual)."""
     try:
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {
-            "vs_currency": "usd",
-            "order": "volume_desc",
-            "per_page": n * 2,
-            "page": 1,
-            "sparkline": False,
-        }
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, params=params, headers=headers, timeout=20)
+        resp = requests.get(
+            BYBIT_TICKERS,
+            params={"category": "linear"},
+            headers=HEADERS,
+            timeout=20
+        )
         resp.raise_for_status()
-        coins = resp.json()
-        symbols = [f"{c['symbol'].upper()}USDT" for c in coins]
-        # Excluir stablecoins
-        stable = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "USDP", "FDUSD"}
-        symbols = [s for s in symbols if s.replace("USDT", "") not in stable]
-        return symbols[:n]
+        items = resp.json().get("result", {}).get("list", [])
+
+        # Filtrar solo pares USDT, excluir stables y tokens apalancados
+        exclude = {"USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD", "USDP"}
+        filtered = [
+            t for t in items
+            if t["symbol"].endswith("USDT")
+            and t["symbol"].replace("USDT", "") not in exclude
+            and float(t.get("turnover24h", 0)) > 0
+        ]
+
+        # Ordenar por volumen en USD (turnover24h)
+        filtered.sort(key=lambda x: float(x.get("turnover24h", 0)), reverse=True)
+        symbols = [t["symbol"] for t in filtered[:n]]
+        print(f"  Top {len(symbols)} symbols obtenidos de Bybit.")
+        return symbols
     except Exception as e:
-        print(f"[ERROR] CoinGecko: {e}")
-        # Fallback: lista hardcoded de los más líquidos
+        print(f"[ERROR] Bybit tickers: {e}")
+        # Fallback hardcoded
         return [
             "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
             "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
@@ -66,32 +78,37 @@ def get_top_symbols(n: int) -> list[str]:
         ]
 
 
-def get_klines_ccxt(symbol: str) -> list[dict]:
-    """Obtiene velas usando CCXT con Binance Futures."""
+def get_klines(symbol: str) -> list[dict]:
+    """Obtiene velas 1h desde Bybit."""
     try:
-        import ccxt
-        exchange = ccxt.binanceusdm({
-            "enableRateLimit": True,
-            "options": {"defaultType": "future"},
-        })
-        ohlcv = exchange.fetch_ohlcv(
-            symbol.replace("USDT", "/USDT"),
-            timeframe="1h",
-            limit=LOOKBACK_CANDLES
+        resp = requests.get(
+            BYBIT_KLINES,
+            params={
+                "category": "linear",
+                "symbol":   symbol,
+                "interval": "60",      # 60 minutos = 1h
+                "limit":    LOOKBACK_CANDLES,
+            },
+            headers=HEADERS,
+            timeout=20
         )
-        return [
-            {
-                "ts":     c[0],
+        resp.raise_for_status()
+        raw = resp.json().get("result", {}).get("list", [])
+        # Bybit devuelve en orden inverso (más reciente primero)
+        raw = list(reversed(raw))
+        candles = []
+        for c in raw:
+            candles.append({
+                "ts":     int(c[0]),
                 "open":   float(c[1]),
                 "high":   float(c[2]),
                 "low":    float(c[3]),
                 "close":  float(c[4]),
                 "volume": float(c[5]),
-            }
-            for c in ohlcv
-        ]
+            })
+        return candles
     except Exception as e:
-        print(f"[WARN] CCXT klines {symbol}: {e}")
+        print(f"[WARN] Bybit klines {symbol}: {e}")
         return []
 
 
@@ -113,9 +130,9 @@ def find_range(candles: list[dict]) -> dict | None:
         if range_size == 0:
             continue
 
-        equilibrium  = (range_high + range_low) / 2
-        tolerance_h  = range_high * TOUCH_TOLERANCE_PCT
-        tolerance_l  = range_low  * TOUCH_TOLERANCE_PCT
+        equilibrium = (range_high + range_low) / 2
+        tolerance_h = range_high * TOUCH_TOLERANCE_PCT
+        tolerance_l = range_low  * TOUCH_TOLERANCE_PCT
 
         touches_high = sum(1 for c in window if abs(c["high"] - range_high) <= tolerance_h)
         touches_low  = sum(1 for c in window if abs(c["low"]  - range_low)  <= tolerance_l)
@@ -154,7 +171,6 @@ def detect_deviation(candles: list[dict], rng: dict) -> dict | None:
     rl   = rng["low"]
 
     prev_inside = rl <= prev["close"] <= rh
-
     if not prev_inside:
         return None
 
@@ -217,18 +233,18 @@ def build_range_embed(symbol: str, rng: dict) -> dict:
     return {
         "embeds": [{
             "title": f"📦  Rango confirmado — ${base}",
-            "url":   f"https://www.binance.com/en/futures/{symbol}",
+            "url":   f"https://www.bybit.com/trade/usdt/{symbol}",
             "color": 0x5865F2,
             "fields": [
-                {"name": "Range High",   "value": f"`{rng['high']}`",        "inline": True},
-                {"name": "Range Low",    "value": f"`{rng['low']}`",         "inline": True},
-                {"name": "Equilibrium",  "value": f"`{rng['equilibrium']}`", "inline": True},
-                {"name": "Tamaño",       "value": f"{rng['range_pct']}%",    "inline": True},
-                {"name": "Duración",     "value": f"~{duration_d} días",     "inline": True},
-                {"name": "Toques",       "value": f"High: {rng['touches_high']}  Low: {rng['touches_low']}", "inline": True},
-                {"name": "Acción",       "value": "Rango válido. Esperá la primera desviación.", "inline": False},
+                {"name": "Range High",  "value": f"`{rng['high']}`",        "inline": True},
+                {"name": "Range Low",   "value": f"`{rng['low']}`",         "inline": True},
+                {"name": "Equilibrium", "value": f"`{rng['equilibrium']}`", "inline": True},
+                {"name": "Tamaño",      "value": f"{rng['range_pct']}%",    "inline": True},
+                {"name": "Duración",    "value": f"~{duration_d} días",     "inline": True},
+                {"name": "Toques",      "value": f"High: {rng['touches_high']}  Low: {rng['touches_low']}", "inline": True},
+                {"name": "Acción",      "value": "Rango válido. Esperá la primera desviación.", "inline": False},
             ],
-            "footer":    {"text": "Binance Futures · TCT Range Scanner"},
+            "footer":    {"text": "Bybit Futures · TCT Range Scanner"},
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         }],
         "username": "TCT Scanner",
@@ -238,9 +254,9 @@ def build_range_embed(symbol: str, rng: dict) -> dict:
 def build_deviation_embed(symbol: str, rng: dict, dev: dict, dev_number: int) -> dict:
     base      = symbol.replace("USDT", "")
     is_second = dev_number >= 2
-    title  = f"🚨  SEGUNDA DESVIACIÓN — ${base} — ENTRY" if is_second else f"⚠️  Primera desviación — ${base}"
-    color  = 0xED4245 if is_second else 0xFEE75C
-    dir_str = "⬆️ Por arriba del Range High" if dev["direction"] == "HIGH" else "⬇️ Por abajo del Range Low"
+    title     = f"🚨  SEGUNDA DESVIACIÓN — ${base} — ENTRY" if is_second else f"⚠️  Primera desviación — ${base}"
+    color     = 0xED4245 if is_second else 0xFEE75C
+    dir_str   = "⬆️ Por arriba del Range High" if dev["direction"] == "HIGH" else "⬇️ Por abajo del Range Low"
 
     if is_second:
         if dev["direction"] == "HIGH":
@@ -248,24 +264,24 @@ def build_deviation_embed(symbol: str, rng: dict, dev: dict, dev_number: int) ->
         else:
             action = f"Segunda desviación abajo → objetivo Range High `{rng['high']}`\nConsiderá LONG al retorno al rango"
     else:
-        action = "Primera desviación. Esperá la segunda para el entry."
+        action = "Primera desviación detectada. Esperá la segunda para el entry."
 
     return {
         "embeds": [{
             "title": title,
-            "url":   f"https://www.binance.com/en/futures/{symbol}",
+            "url":   f"https://www.bybit.com/trade/usdt/{symbol}",
             "color": color,
             "fields": [
-                {"name": "Dirección",     "value": dir_str,                   "inline": True},
-                {"name": "Precio",        "value": f"`{dev['price']}`",        "inline": True},
-                {"name": "Breach",        "value": f"{dev['breach']}% fuera",  "inline": True},
-                {"name": "Range High",    "value": f"`{rng['high']}`",         "inline": True},
-                {"name": "Range Low",     "value": f"`{rng['low']}`",          "inline": True},
-                {"name": "Equilibrium",   "value": f"`{rng['equilibrium']}`",  "inline": True},
-                {"name": "Desviación #",  "value": f"**{dev_number} de 2**",   "inline": True},
-                {"name": "Acción",        "value": action,                     "inline": False},
+                {"name": "Dirección",    "value": dir_str,                  "inline": True},
+                {"name": "Precio",       "value": f"`{dev['price']}`",       "inline": True},
+                {"name": "Breach",       "value": f"{dev['breach']}% fuera", "inline": True},
+                {"name": "Range High",   "value": f"`{rng['high']}`",        "inline": True},
+                {"name": "Range Low",    "value": f"`{rng['low']}`",         "inline": True},
+                {"name": "Equilibrium",  "value": f"`{rng['equilibrium']}`", "inline": True},
+                {"name": "Desviación #", "value": f"**{dev_number} de 2**",  "inline": True},
+                {"name": "Acción",       "value": action,                    "inline": False},
             ],
-            "footer":    {"text": "Binance Futures · TCT Range Scanner"},
+            "footer":    {"text": "Bybit Futures · TCT Range Scanner"},
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
         }],
         "username": "TCT Scanner",
@@ -274,7 +290,7 @@ def build_deviation_embed(symbol: str, rng: dict, dev: dict, dev_number: int) ->
 
 def main():
     now_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{now_str}] Iniciando TCT Range Scanner...")
+    print(f"[{now_str}] Iniciando TCT Range Scanner (Bybit)...")
 
     state   = load_state()
     symbols = get_top_symbols(TOP_N_COINS)
@@ -284,9 +300,9 @@ def main():
 
     for symbol in symbols:
         print(f"  {symbol}...")
-        time.sleep(0.3)  # evitar rate limit
+        time.sleep(0.2)
 
-        candles = get_klines_ccxt(symbol)
+        candles = get_klines(symbol)
         if len(candles) < MIN_RANGE_CANDLES + 10:
             print(f"    Datos insuficientes ({len(candles)} velas).")
             continue
