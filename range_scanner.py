@@ -1,4 +1,3 @@
-
 """
 Wyckoff Range Scanner — TCT Method
 Detecta rangos válidos en Binance Futures (1h) y alerta en Discord cuando:
@@ -21,6 +20,9 @@ STATE_FILE = "range_state.json"
 BINANCE_EXCHANGE_INFO = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 BINANCE_KLINES        = "https://fapi.binance.com/fapi/v1/klines"
 BINANCE_TICKER        = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+
+# Fallback endpoints si Binance bloquea
+BINANCE_TICKER_ALT    = "https://api.binance.com/api/v3/ticker/24hr"
 
 # Mínimo de velas en rango para considerarlo válido (24 velas de 1h = 1 día)
 MIN_RANGE_CANDLES = 24
@@ -57,41 +59,61 @@ def save_state(state: dict):
 
 
 def get_top_symbols_by_volume(n: int) -> list[str]:
-    try:
-        resp = requests.get(BINANCE_TICKER, timeout=15)
-        resp.raise_for_status()
-        tickers = [
-            t for t in resp.json()
-            if t["symbol"].endswith("USDT")
-            and not any(x in t["symbol"] for x in ["BULL", "BEAR", "UP", "DOWN"])
-        ]
-        tickers.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
-        return [t["symbol"] for t in tickers[:n]]
-    except Exception as e:
-        print(f"[ERROR] Top symbols: {e}")
-        return []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
+    endpoints = [BINANCE_TICKER, BINANCE_TICKER_ALT]
+    for url in endpoints:
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            resp.raise_for_status()
+            tickers = [
+                t for t in resp.json()
+                if t["symbol"].endswith("USDT")
+                and not any(x in t["symbol"] for x in ["BULL", "BEAR", "UP", "DOWN"])
+            ]
+            tickers.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
+            symbols = [t["symbol"] for t in tickers[:n]]
+            print(f"    Symbols obtenidos desde: {url}")
+            return symbols
+        except Exception as e:
+            print(f"[WARN] Top symbols desde {url}: {e}")
+            continue
+    print("[ERROR] No se pudo obtener symbols de ningún endpoint.")
+    return []
 
 
 def get_klines(symbol: str, interval: str = "1h", limit: int = LOOKBACK_CANDLES) -> list[dict]:
-    try:
-        resp = requests.get(BINANCE_KLINES, params={
-            "symbol": symbol, "interval": interval, "limit": limit
-        }, timeout=15)
-        resp.raise_for_status()
-        candles = []
-        for c in resp.json():
-            candles.append({
-                "open":   float(c[1]),
-                "high":   float(c[2]),
-                "low":    float(c[3]),
-                "close":  float(c[4]),
-                "volume": float(c[5]),
-                "ts":     int(c[0]),
-            })
-        return candles
-    except Exception as e:
-        print(f"[WARN] Klines {symbol}: {e}")
-        return []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
+    endpoints = [
+        BINANCE_KLINES,
+        f"https://api.binance.com/api/v3/klines",
+    ]
+    for url in endpoints:
+        try:
+            resp = requests.get(url, params={
+                "symbol": symbol, "interval": interval, "limit": limit
+            }, headers=headers, timeout=20)
+            resp.raise_for_status()
+            candles = []
+            for c in resp.json():
+                candles.append({
+                    "open":   float(c[1]),
+                    "high":   float(c[2]),
+                    "low":    float(c[3]),
+                    "close":  float(c[4]),
+                    "volume": float(c[5]),
+                    "ts":     int(c[0]),
+                })
+            return candles
+        except Exception as e:
+            print(f"[WARN] Klines {symbol} desde {url}: {e}")
+            continue
+    return []
 
 
 def find_range(candles: list[dict]) -> dict | None:
