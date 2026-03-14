@@ -1,4 +1,3 @@
-
 """
 Binance Meme Coin — ATH Decline Tracker
 Detecta meme coins en Binance Futures que están empezando a caer desde su techo.
